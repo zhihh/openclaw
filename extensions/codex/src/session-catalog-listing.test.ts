@@ -1,6 +1,11 @@
 // Codex supervision tests cover passive listing and safe local session takeover.
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import { describe, expect, it, vi } from "vitest";
+import { MAX_HOST_COUNT } from "./session-catalog-parsing.js";
+import type { CodexSessionCatalogPage } from "./session-catalog-types.js";
 import {
+  commandRpcMocks,
+  pinnedConnectionMocks,
   tempDirs,
   createCodexSessionCatalogControl,
   listCodexSessionCatalog,
@@ -20,7 +25,7 @@ import {
   os,
   path,
   resolveAgentDir,
-  resolveSessionAgentIds,
+  resolveSessionAgentIdsStrict,
   resolveCodexAppServerHomeDir,
   resolveCodexAppServerLocalHomeDir,
   resolveDefaultAgentDir,
@@ -34,103 +39,7 @@ import {
   createCodexSessionCatalogControlFactory,
   type CodexCatalogHome,
   type OpenClawConfig,
-  originalPath,
 } from "./session-catalog.test-helpers.js";
-
-const commandRpcMocks = vi.hoisted(() => ({
-  codexControlRequest: vi.fn(),
-}));
-const pinnedConnectionMocks = vi.hoisted(() => ({
-  client: { connectionId: "pinned-catalog-client" },
-  getClient: vi.fn(),
-  releaseClient: vi.fn(),
-  request: vi.fn(),
-}));
-const transcriptMirrorMocks = vi.hoisted(() => ({
-  importCodexThreadHistoryToTranscript: vi.fn(async () => ({
-    importedMessages: 0,
-    omittedMessages: 0,
-  })),
-}));
-const nodeHostMocks = vi.hoisted(() => ({
-  runNodePtyCommand: vi.fn(async () => ({ exitCode: 0 })),
-  userShellPaths: new Map<string, string>(),
-}));
-
-vi.mock("./command-rpc.js", () => ({
-  codexControlRequest: commandRpcMocks.codexControlRequest,
-}));
-vi.mock("./app-server/request.js", () => ({
-  requestCodexAppServerClientJson: pinnedConnectionMocks.request,
-}));
-vi.mock("./app-server/shared-client.js", () => ({
-  getLeasedSharedCodexAppServerClient: pinnedConnectionMocks.getClient,
-  releaseLeasedSharedCodexAppServerClient: pinnedConnectionMocks.releaseClient,
-}));
-vi.mock("./app-server/transcript-mirror.js", () => ({
-  importCodexThreadHistoryToTranscript: transcriptMirrorMocks.importCodexThreadHistoryToTranscript,
-}));
-vi.mock("./session-catalog-pty.runtime.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./session-catalog-pty.runtime.js")>();
-  return {
-    ...actual,
-    runNodePtyCommand: nodeHostMocks.runNodePtyCommand,
-    resolveNodeHostExecutable: (
-      command: string,
-      options: {
-        env?: NodeJS.ProcessEnv;
-        pathEnv?: string;
-        includeExtensionless?: boolean;
-        strategy: "direct" | "fallback" | "prefer";
-      },
-    ) => {
-      const env = options.env ?? process.env;
-      const pathEnv = options.pathEnv ?? env.PATH ?? env.Path ?? "";
-      const direct = actual.resolveNodeHostExecutable(command, {
-        env,
-        pathEnv,
-        includeExtensionless: options.includeExtensionless,
-        strategy: "direct",
-      });
-      if (direct && options.strategy !== "prefer") {
-        return direct;
-      }
-      const shellPath = nodeHostMocks.userShellPaths.get(command);
-      if (!shellPath) {
-        return direct;
-      }
-      const shellExecutable = actual.resolveNodeHostExecutable(command, {
-        env,
-        pathEnv: shellPath,
-        includeExtensionless: options.includeExtensionless,
-        strategy: "direct",
-      });
-      return shellExecutable
-        ? { executable: shellExecutable.executable, pathEnv: shellPath }
-        : direct;
-    },
-  };
-});
-
-beforeEach(() => {
-  nodeHostMocks.runNodePtyCommand.mockClear();
-  nodeHostMocks.userShellPaths.clear();
-  commandRpcMocks.codexControlRequest.mockReset();
-  pinnedConnectionMocks.getClient.mockReset();
-  pinnedConnectionMocks.getClient.mockResolvedValue(pinnedConnectionMocks.client);
-  pinnedConnectionMocks.releaseClient.mockReset();
-  pinnedConnectionMocks.request.mockReset();
-  transcriptMirrorMocks.importCodexThreadHistoryToTranscript.mockReset();
-  transcriptMirrorMocks.importCodexThreadHistoryToTranscript.mockResolvedValue({
-    importedMessages: 0,
-    omittedMessages: 0,
-  });
-});
-
-afterEach(async () => {
-  process.env.PATH = originalPath;
-  await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
-});
 
 describe("Codex session catalog errors", () => {
   it("preserves fallback names returned by paired nodes", () => {
@@ -166,6 +75,85 @@ describe("Codex session catalog errors", () => {
 });
 
 describe("Codex supervision catalog", () => {
+  it("does not classify threads or request another page when retired during a local page", async () => {
+    const firstPage = createDeferred<CodexSessionCatalogPage>();
+    const pageStarted = createDeferred<void>();
+    const listPage = vi.fn(async ({ cursor }: { cursor?: string }) => {
+      if (cursor) {
+        return { sessions: [] };
+      }
+      pageStarted.resolve();
+      return firstPage.promise;
+    });
+    const mark = vi.fn(async () => undefined);
+    const bindingStore = Object.assign(createCodexTestBindingStore(), {
+      managedThreads: {
+        has: vi.fn(async () => false),
+        mark,
+        snapshot: vi.fn(async () => new Map<string, ReadonlySet<string>>()),
+      },
+    });
+    const home: CodexCatalogHome = {
+      sourceHomeId: "home-main",
+      hostId: CODEX_LOCAL_SESSION_HOST_ID,
+      label: "Main",
+      agentDir: "/agents/main",
+      appServer: {} as CodexCatalogHome["appServer"],
+      usesProcessHomeFallback: false,
+    };
+    const controller = new AbortController();
+    const listed = listCodexSessionCatalog({
+      bindingStore,
+      config,
+      runtime: createRuntime().runtime,
+      control: createControl({ listPage }),
+      localHomes: [home],
+      query: { hostIds: [CODEX_LOCAL_SESSION_HOST_ID] },
+      signal: controller.signal,
+    });
+    await pageStarted.promise;
+    controller.abort(new Error("catalog retired during page"));
+    firstPage.resolve({
+      sessions: [],
+      managedThreads: [{ threadId: "managed" }],
+      nextCursor: "next",
+    });
+    const result = await listed;
+    expect({ pages: listPage.mock.calls.length, marks: mark.mock.calls.length }).toEqual({
+      pages: 1,
+      marks: 0,
+    });
+    expect(result.hosts[0]?.error?.code).toBe("APP_SERVER_UNAVAILABLE");
+  });
+
+  it("does not start local hosts when retired during the managed-thread snapshot", async () => {
+    const snapshotResult = createDeferred<Map<string, ReadonlySet<string>>>();
+    const snapshot = vi.fn(() => snapshotResult.promise);
+    const bindingStore = Object.assign(createCodexTestBindingStore(), {
+      managedThreads: { has: vi.fn(async () => false), mark: vi.fn(), snapshot },
+    });
+    const listPage = vi.fn(async () => ({ sessions: [] }));
+    const controller = new AbortController();
+    const reason = new Error("catalog retired during snapshot");
+    const listed = listCodexSessionCatalog({
+      bindingStore,
+      config,
+      runtime: createRuntime().runtime,
+      control: createControl({ listPage }),
+      query: { hostIds: [CODEX_LOCAL_SESSION_HOST_ID] },
+      signal: controller.signal,
+      waitUntil: () => {
+        controller.signal.throwIfAborted();
+      },
+    }).catch((error: unknown) => error);
+    expect(snapshot).toHaveBeenCalledOnce();
+    controller.abort(reason);
+    snapshotResult.resolve(new Map());
+    const result = await listed;
+    expect(listPage).not.toHaveBeenCalled();
+    expect(result).toBe(reason);
+  });
+
   it("lists non-archived interactive threads without probing transcript previews", async () => {
     const pluginConfig = await normalizeCodexManifestConfig({
       supervision: { enabled: true },
@@ -184,7 +172,13 @@ describe("Codex supervision catalog", () => {
         },
         {
           id: "thread-preview",
-          preview: "Match appears only in private preview text",
+          preview: "Unrelated private preview text",
+          status: { type: "idle" },
+          source: "cli",
+        },
+        {
+          id: "thread-fallback",
+          preview: "Match visible fallback title",
           status: { type: "idle" },
           source: "cli",
         },
@@ -205,6 +199,13 @@ describe("Codex supervision catalog", () => {
           cwd: "/workspace/one",
           status: "idle",
           source: "vscode",
+          archived: false,
+        },
+        {
+          threadId: "thread-fallback",
+          fallbackName: "Match visible fallback title",
+          status: "idle",
+          source: "cli",
           archived: false,
         },
       ],
@@ -248,7 +249,7 @@ describe("Codex supervision catalog", () => {
       ) => {
         if (!options.agentDir) {
           try {
-            resolveSessionAgentIds({ config: options.config });
+            resolveSessionAgentIdsStrict({ config: options.config });
           } catch (error) {
             throw new Error((error as { code?: string }).code ?? String(error), { cause: error });
           }
@@ -285,27 +286,43 @@ describe("Codex supervision catalog", () => {
     });
   });
 
-  it("discovers every existing Codex home while retaining the route owner directory", async () => {
+  it("discovers configured and automatic Codex homes while retaining the route owner", async () => {
     const root = await fs.realpath(
       await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-catalog-homes-")),
     );
     tempDirs.push(root);
     const alphaAgentDir = path.join(root, "agents", "alpha", "agent");
     const betaAgentDir = path.join(root, "agents", "beta", "agent");
+    const fileAgentDir = path.join(root, "agents", "file", "agent");
     const processCodexHome = path.join(root, "process-codex-home");
     const alphaCodexHome = resolveCodexAppServerHomeDir(alphaAgentDir);
     const betaCodexHome = resolveCodexAppServerHomeDir(betaAgentDir);
+    const fileAgentCodexHome = resolveCodexAppServerHomeDir(fileAgentDir);
+    const configuredCodexHomes = Array.from({ length: MAX_HOST_COUNT }, (_, index) =>
+      path.join(root, "configured-codex-home", String(index)),
+    );
+    const configuredCodexHome = configuredCodexHomes[0]!;
+    const configuredCodexHomeAlias = path.join(root, "configured-codex-home-alias");
+    const configuredFile = path.join(root, "not-a-codex-home");
     await Promise.all(
-      [processCodexHome, alphaCodexHome, betaCodexHome].map((dir) =>
+      [processCodexHome, alphaCodexHome, betaCodexHome, ...configuredCodexHomes].map((dir) =>
         fs.mkdir(dir, { recursive: true }),
       ),
     );
+    await Promise.all([
+      fs.symlink(configuredCodexHome, configuredCodexHomeAlias, "dir"),
+      fs.writeFile(configuredFile, "not a directory"),
+      fs
+        .mkdir(fileAgentDir, { recursive: true })
+        .then(() => fs.writeFile(fileAgentCodexHome, "not a directory")),
+    ]);
     const runtimeConfig = {
       agents: {
         ownership: "explicit",
         list: [
           { id: "alpha", agentDir: alphaAgentDir },
           { id: "beta", agentDir: betaAgentDir },
+          { id: "file", agentDir: fileAgentDir },
         ],
       },
     } as OpenClawConfig;
@@ -315,21 +332,41 @@ describe("Codex supervision catalog", () => {
       config: runtimeConfig,
       env,
       getRuntimeConfig: () => runtimeConfig,
-      getPluginConfig: () => ({ supervision: { enabled: true } }),
+      getPluginConfig: () => ({
+        supervision: { enabled: true },
+        sessionCatalog: {
+          homes: [
+            configuredCodexHome,
+            { path: configuredCodexHomeAlias, label: "Duplicate alias" },
+            { path: configuredCodexHomes[1]!, label: "Named store" },
+            { path: configuredCodexHomes[2]! },
+            alphaCodexHome,
+            path.join(root, "missing-codex-home"),
+            configuredFile,
+            ...configuredCodexHomes.slice(3),
+          ],
+        },
+      }),
     });
     const homes = control.homesForAgent("beta");
 
-    expect(
-      new Set(
-        homes.map((home) =>
-          resolveCodexAppServerLocalHomeDir(home.appServer.start, home.agentDir, env),
-        ),
-      ),
-    ).toEqual(new Set([processCodexHome, alphaCodexHome, betaCodexHome]));
-    expect(homes.map((home) => home.agentDir)).toEqual([betaAgentDir, betaAgentDir, betaAgentDir]);
+    const resolvedHomes = homes.map((home) =>
+      resolveCodexAppServerLocalHomeDir(home.appServer.start, home.agentDir, env),
+    );
+    expect(homes).toHaveLength(MAX_HOST_COUNT);
+    expect(resolvedHomes.slice(0, 3)).toEqual([processCodexHome, betaCodexHome, alphaCodexHome]);
+    expect(resolvedHomes.filter((home) => configuredCodexHomes.includes(home))).toHaveLength(
+      MAX_HOST_COUNT - 3,
+    );
+    expect(homes.slice(3, 6).map((home) => home.label)).toEqual([
+      "Local Codex · 0",
+      "Local Codex · Named store",
+      "Local Codex · 2",
+    ]);
+    expect(homes.map((home) => home.agentDir)).toEqual(Array(MAX_HOST_COUNT).fill(betaAgentDir));
     expect(homes[0]?.hostId).toBe(CODEX_LOCAL_SESSION_HOST_ID);
     expect(homes.slice(1).every((home) => home.hostId.startsWith("gateway:local:"))).toBe(true);
-    expect(new Set(homes.map((home) => home.sourceHomeId)).size).toBe(3);
+    expect(new Set(homes.map((home) => home.sourceHomeId)).size).toBe(MAX_HOST_COUNT);
     expect(
       JSON.stringify(homes.map(({ hostId, sourceHomeId }) => ({ hostId, sourceHomeId }))),
     ).not.toContain(root);
@@ -338,18 +375,18 @@ describe("Codex supervision catalog", () => {
     pinnedConnectionMocks.request.mockResolvedValue({
       thread: idleThread({ id: "thread-source" }),
     });
-    const alphaSource = homes.find(
+    const configuredSource = homes.find(
       (home) =>
         resolveCodexAppServerLocalHomeDir(home.appServer.start, home.agentDir, env) ===
-        alphaCodexHome,
+        configuredCodexHome,
     );
-    expect(alphaSource).toBeDefined();
+    expect(configuredSource).toBeDefined();
 
-    const alphaFingerprint = buildCodexAppServerConnectionFingerprint(
-      alphaSource!.appServer,
-      alphaSource!.agentDir,
+    const configuredFingerprint = buildCodexAppServerConnectionFingerprint(
+      configuredSource!.appServer,
+      configuredSource!.agentDir,
     );
-    const boundControl = control.forUpstream("beta", alphaFingerprint);
+    const boundControl = control.forUpstream("beta", configuredFingerprint);
     expect(boundControl).toBeDefined();
     expect(control.forUpstream("beta", "unknown-fingerprint")).toBeUndefined();
     await boundControl!.listPage({});
@@ -359,13 +396,13 @@ describe("Codex supervision catalog", () => {
 
     expect(commandRpcMocks.codexControlRequest.mock.calls[0]?.[3]).toMatchObject({
       agentDir: betaAgentDir,
-      startOptions: { env: { CODEX_HOME: alphaCodexHome } },
+      startOptions: { env: { CODEX_HOME: configuredCodexHome } },
     });
     expect(pinnedConnectionMocks.getClient).toHaveBeenCalledWith(
       expect.objectContaining({
         agentDir: betaAgentDir,
         startOptions: expect.objectContaining({
-          env: expect.objectContaining({ CODEX_HOME: alphaCodexHome }),
+          env: expect.objectContaining({ CODEX_HOME: configuredCodexHome }),
         }),
       }),
     );
@@ -399,7 +436,7 @@ describe("Codex supervision catalog", () => {
       },
     } as OpenClawConfig;
     let runtimeConfig = configA;
-    const existsSync = vi.spyOn(fsSync, "existsSync");
+    const statSync = vi.spyOn(fsSync, "statSync");
     try {
       const resolver = createCodexCatalogHomeResolver({
         config: configA,
@@ -407,11 +444,11 @@ describe("Codex supervision catalog", () => {
         getPluginConfig: () => ({ supervision: { enabled: true } }),
         env: { ...process.env, CODEX_HOME: processCodexHome },
       });
-      const seedDiscoveryCount = existsSync.mock.calls.length;
+      const seedDiscoveryCount = statSync.mock.calls.length;
 
       expect(resolver.forAgent("alpha")).not.toHaveLength(0);
       expect(resolver.forAgent("alpha")).not.toHaveLength(0);
-      expect(existsSync).toHaveBeenCalledTimes(seedDiscoveryCount);
+      expect(statSync).toHaveBeenCalledTimes(seedDiscoveryCount);
 
       runtimeConfig = configB;
       const betaHomes = resolver.forAgent("beta");
@@ -422,12 +459,12 @@ describe("Codex supervision catalog", () => {
             betaCodexHome,
         ),
       ).toBe(true);
-      const reloadedDiscoveryCount = existsSync.mock.calls.length;
+      const reloadedDiscoveryCount = statSync.mock.calls.length;
 
       expect(resolver.forAgent("beta")).toEqual(betaHomes);
-      expect(existsSync).toHaveBeenCalledTimes(reloadedDiscoveryCount);
+      expect(statSync).toHaveBeenCalledTimes(reloadedDiscoveryCount);
     } finally {
-      existsSync.mockRestore();
+      statSync.mockRestore();
     }
   });
 
@@ -479,12 +516,22 @@ describe("Codex supervision catalog", () => {
     });
 
     await withEnvAsync({ CODEX_HOME: processCodexHome }, async () => {
-      const hosts = await getProvider()?.list({
+      const onHost = vi.fn();
+      const completions: Promise<void>[] = [];
+      const hosts = await getProvider()!.list({
         agentId: "beta",
         listNodes: async () => ({ nodes: [] }),
+        onHost,
+        waitUntil: (completion) => {
+          completions.push(completion);
+        },
       });
 
       expect(hosts).toHaveLength(3);
+      expect(completions).toHaveLength(3);
+      await Promise.all(completions);
+      expect(onHost).toHaveBeenCalledTimes(3);
+      expect(onHost.mock.calls.map(([host]) => host)).toEqual(expect.arrayContaining(hosts));
       expect(hosts?.every((host) => host.hostId.startsWith("gateway:local"))).toBe(true);
       expect(
         hosts?.every(
@@ -553,6 +600,134 @@ describe("Codex supervision catalog", () => {
     expect(sessions.get(homeB.hostId)).not.toHaveProperty("sessionKey");
   });
 
+  it("bulk-loads managed thread ids once and backfills visible catalog pages", async () => {
+    const homeA: CodexCatalogHome = {
+      sourceHomeId: "home-a",
+      hostId: CODEX_LOCAL_SESSION_HOST_ID,
+      label: "home-a",
+      agentDir: "/agents/main",
+      appServer: {} as CodexCatalogHome["appServer"],
+      usesProcessHomeFallback: false,
+    };
+    const homeB: CodexCatalogHome = {
+      ...homeA,
+      sourceHomeId: "home-b",
+      hostId: `${CODEX_LOCAL_SESSION_HOST_ID}:home-b`,
+      label: "home-b",
+    };
+    const snapshot = vi.fn(
+      async () => new Map<string, ReadonlySet<string>>([["home-a", new Set(["thread-managed"])]]),
+    );
+    const bindingStore = Object.assign(createCodexTestBindingStore(), {
+      managedThreads: { has: vi.fn(async () => false), mark: vi.fn(), snapshot },
+    });
+    const listPage = vi.fn(async (params?: { cursor?: string; limit?: number }) =>
+      params?.cursor === "next"
+        ? {
+            sessions: [
+              { threadId: "thread-visible-2", status: "idle", source: "cli", archived: false },
+            ],
+          }
+        : {
+            sessions: [
+              { threadId: "thread-managed", status: "idle", source: "vscode", archived: false },
+              { threadId: "thread-visible-1", status: "idle", source: "cli", archived: false },
+            ],
+            nextCursor: "next",
+          },
+    );
+    const control = createControl({ listPage });
+
+    const result = await listCodexSessionCatalog({
+      agentId: "main",
+      bindingStore,
+      config,
+      runtime: createRuntime().runtime,
+      control,
+      query: { limitPerHost: 2 },
+      localHomes: [homeA, homeB],
+      listNodes: async () => ({ nodes: [] }),
+    });
+
+    expect(snapshot).toHaveBeenCalledOnce();
+    expect(listPage).toHaveBeenCalledTimes(3);
+    expect(result.hosts[0]?.sessions.map((session) => session.threadId)).toEqual([
+      "thread-visible-1",
+      "thread-visible-2",
+    ]);
+    expect(result.hosts[1]?.sessions.map((session) => session.threadId)).toEqual([
+      "thread-managed",
+      "thread-visible-1",
+    ]);
+  });
+
+  it("backfills a provenance-filtered first page through the real listing path", async () => {
+    const root = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-provenance-page-")),
+    );
+    tempDirs.push(root);
+    const sessionsRoot = path.join(root, "sessions");
+    await fs.mkdir(sessionsRoot);
+    const rolloutPath = path.join(sessionsRoot, "managed.jsonl");
+    await fs.writeFile(
+      rolloutPath,
+      `${JSON.stringify({
+        type: "session_meta",
+        payload: { id: "thread-managed", originator: "openclaw" },
+      })}\n`,
+    );
+    commandRpcMocks.codexControlRequest.mockImplementation(
+      async (_pluginConfig: unknown, method: string, params: { cursor?: string }) => {
+        expect(method).toBe("thread/list");
+        return params.cursor === "native-page"
+          ? { data: [idleThread({ id: "thread-native", source: "cli" })] }
+          : {
+              data: [
+                idleThread({
+                  id: "thread-managed",
+                  path: rolloutPath,
+                  source: "vscode",
+                }),
+              ],
+              nextCursor: "native-page",
+            };
+      },
+    );
+    const runtimeConfig = config;
+    const control = createCodexSessionCatalogControlFactory({
+      env: { ...process.env, CODEX_HOME: root },
+      getPluginConfig: () => ({ supervision: { enabled: true } }),
+      getRuntimeConfig: () => runtimeConfig,
+    });
+    const home = control.homesForAgent("main")[0]!;
+    const mark = vi.fn(async () => true);
+    const bindingStore = Object.assign(createCodexTestBindingStore(), {
+      managedThreads: {
+        has: vi.fn(async () => false),
+        mark,
+        snapshot: vi.fn(async () => new Map<string, ReadonlySet<string>>()),
+      },
+    });
+
+    const result = await listCodexSessionCatalog({
+      agentId: "main",
+      bindingStore,
+      config: runtimeConfig,
+      runtime: createRuntime().runtime,
+      control,
+      query: { limitPerHost: 1 },
+      localHomes: [home],
+      listNodes: async () => ({ nodes: [] }),
+    });
+
+    expect(result.hosts[0]?.sessions.map((session) => session.threadId)).toEqual(["thread-native"]);
+    expect(mark).toHaveBeenCalledWith({
+      sourceHomeId: home.sourceHomeId,
+      threadId: "thread-managed",
+      rolloutPath,
+    });
+  });
+
   it("uses a sanitized preview only when Codex has no thread name", async () => {
     const pluginConfig = { supervision: { enabled: true } };
     commandRpcMocks.codexControlRequest.mockResolvedValue({
@@ -566,7 +741,7 @@ describe("Codex supervision catalog", () => {
         },
         {
           id: "thread-fallback",
-          preview: "Investigate\nfailed Rosita run",
+          preview: "\x1b[31mInvestigate\x1b[0m\nfailed\x00 Rosita\x7f run",
           status: { type: "idle" },
           source: "cli",
         },

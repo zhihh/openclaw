@@ -9,6 +9,7 @@ export type TypingMode = "never" | "instant" | "thinking" | "message";
 export type SessionScope = "per-sender" | "global";
 /** DM session-key granularity across peers, channels, and accounts. */
 export type DmScope = "main" | "per-peer" | "per-channel-peer" | "per-account-channel-peer";
+export type GroupScope = "main" | "per-group";
 /** Which source messages outbound replies should thread or quote against. */
 export type ReplyToMode = "off" | "first" | "all" | "batched";
 /** Group-chat admission policy for channels with allowlists. */
@@ -189,12 +190,12 @@ export type SessionThreadBindingsConfig = {
   enabled?: boolean;
   /**
    * Inactivity window for thread-bound sessions (hours).
-   * Session auto-unfocuses after this amount of idle time. Set to 0 to disable. Default: 24.
+   * Binding expires after this amount of idle time. Set to 0 to disable. Default: 24.
    */
   idleHours?: number;
   /**
    * Optional hard max age for thread-bound sessions (hours).
-   * Session auto-unfocuses once this age is reached even if active. Set to 0 to disable. Default: 0.
+   * Binding expires once this age is reached even if active. Set to 0 to disable. Default: 0.
    */
   maxAgeHours?: number;
   /**
@@ -223,6 +224,8 @@ export type SessionConfig = {
   scope?: SessionScope;
   /** DM session scoping (default: "main"). */
   dmScope?: DmScope;
+  /** Group/channel session scoping (default: "per-group"). */
+  groupScope?: GroupScope;
   /** Map platform-prefixed identities (e.g. "telegram:123") to canonical DM peers. */
   identityLinks?: Record<string, string[]>;
   resetTriggers?: string[];
@@ -247,9 +250,11 @@ export type SessionMaintenanceMode = "enforce" | "warn";
 export type SessionMaintenanceConfig = {
   /** Whether to enforce maintenance or warn only. Default: "enforce". */
   mode?: SessionMaintenanceMode;
-  /** Remove session entries older than this duration (e.g. "30d", "12h"). Default: "30d". */
+  /** Archive eligible conversations and remove disposable entries older than this duration. Default: "30d". */
   pruneAfter?: string | number;
-  /** Maximum total session entries to keep when protection permits. Default: 500. */
+  /** Archive inactive dashboard sessions after this duration. Default: "7d"; false or 0 disables. */
+  archiveDashboardAfter?: string | number | false;
+  /** Maximum unarchived entries when protection permits; durable overflow is archived. Default: 5000. */
   maxEntries?: number;
   /** Protect interactive sessions active within this duration. Default and false: disabled. */
   preserveRecent?: string | number | false;
@@ -260,9 +265,9 @@ export type SessionMaintenanceConfig = {
    */
   resetArchiveRetention?: string | number | false;
   /**
-   * Per-agent sessions-directory disk budget (e.g. "500mb"). Default: "10gb".
-   * When exceeded, warn (mode=warn) or enforce oldest-first cleanup
-   * (mode=enforce). Set `false`, `0`, or `"0"` to disable the budget entirely.
+   * Per-agent physical budget for SQLite main/WAL and counted session-directory artifacts. Default: "10gb".
+   * Warn mode reports pressure; enforce mode applies oldest-first cleanup.
+   * Protected data may exceed the target. Set `false`, `0`, or `"0"` to disable.
    */
   maxDiskBytes?: number | string | false;
   /**

@@ -6,13 +6,28 @@
  * group config, then returns sender/route/command/activation projections plus
  * the ordered ingress graph.
  */
+import {
+  createChannelIngressMonitor,
+  type ChannelIngressMonitorDrainOptions,
+  type ChannelIngressMonitorFacts,
+  type ChannelIngressMonitorLifecycle,
+  type ChannelIngressMonitorPayloadCodec,
+  type CreateChannelIngressMonitorOptions,
+} from "../channels/message/ingress-monitor.js";
 export {
   channelIngressRoutes,
   createChannelIngressResolver,
   resolveChannelMessageIngress,
   resolveStableChannelMessageIngress,
 } from "../channels/message-access/runtime.js";
-export { defineStableChannelIngressIdentity } from "../channels/message-access/runtime-identity.js";
+export {
+  meetsIdentifierAuthentication,
+  type IdentifierAuthentication,
+} from "../channels/message-access/identifier-authentication.js";
+export {
+  defineStableChannelIngressIdentity,
+  identityEntryAuthenticationClassifier,
+} from "../channels/message-access/runtime-identity.js";
 export { readChannelIngressStoreAllowFromForDmPolicy } from "../channels/message-access/store-allow-from.js";
 export { resolveChannelImplicitMentions } from "../config/implicit-mentions.js";
 export type {
@@ -47,15 +62,6 @@ export type {
   IngressReasonCode,
 } from "../channels/message-access/types.js";
 export type { ResolvedChannelImplicitMentions } from "../config/implicit-mentions.js";
-
-import {
-  createChannelIngressMonitor,
-  type ChannelIngressMonitorDrainOptions,
-  type ChannelIngressMonitorFacts,
-  type ChannelIngressMonitorLifecycle,
-  type ChannelIngressMonitorPayloadCodec,
-  type CreateChannelIngressMonitorOptions,
-} from "../channels/message/ingress-monitor.js";
 
 type ChannelIngressLifecycle = Omit<ChannelIngressMonitorLifecycle, "admission">;
 
@@ -179,6 +185,11 @@ export function fanInChannelIngressLifecycles(
         handedOff = true;
         for (const lifecycle of lifecycles) {
           lifecycle.onDeferred();
+        }
+      },
+      onDeferredHeartbeat: () => {
+        for (const lifecycle of lifecycles) {
+          lifecycle.onDeferredHeartbeat?.();
         }
       },
       onAdoptionFinalizing: () => {
